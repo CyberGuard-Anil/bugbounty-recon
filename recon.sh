@@ -6,66 +6,105 @@
 # Description: One-click recon tool
 # ----------------------------------------
 
-# Colors
-GREEN='\033[1;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[1;36m'
-RED='\033[1;31m'
-NC='\033[0m'
-export PATH=$PATH:$HOME/go/bin
+set -euo pipefail
 
+# Colors for output
+RED=$(tput setaf 1)
+GRN=$(tput setaf 2)
+YEL=$(tput setaf 3)
+BLU=$(tput setaf 4)
+RST=$(tput sgr0)
 
-# Tool Checker Function
-check_tool() {
-  if ! command -v "$1" &>/dev/null; then
-    echo -e "${RED} Tool '$1' not found. Please run ./tools-setup.sh first.${NC}"
-    exit 1
-  fi
+LOGFILE=""
+
+log() {
+    echo -e "[$(date +'%H:%M:%S')] ${GRN}[INFO]${RST} $1"
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] [INFO] $1" >> "$LOGFILE"
 }
 
-# Check required tools
-for tool in subfinder httpx naabu ffuf; do
-  check_tool "$tool"
-done
+err() {
+    echo -e "[$(date +'%H:%M:%S')] ${RED}[ERROR]${RST} $1" >&2
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] [ERROR] $1" >> "$LOGFILE"
+}
 
-# Input domain check
-if [ -z "$1" ]; then
-  echo -e "${RED} Usage: ./recon.sh <target.com>${NC}"
-  exit 1
+usage() {
+    echo -e "${BLU}Usage:${RST} $0 domain.com"
+    echo -e "Example: $0 hackerone.com"
+    exit 1
+}
+
+trap_cleanup() {
+    err "Script interrupted! Cleaning up..."
+    # Kill background jobs if any
+    jobs -p | xargs -r kill
+    exit 130
+}
+trap trap_cleanup INT
+
+# Check input argument
+if [[ $# -ne 1 ]]; then
+    usage
 fi
 
-TARGET=$1
-DATE=$(date +"%Y-%m-%d_%H-%M-%S")
-OUTPUT_DIR="./output/$TARGET-$DATE"
-WORDLIST="/usr/share/seclists/Discovery/Web-Content/raft-small-words.txt"
+domain=$1
 
-mkdir -p "$OUTPUT_DIR/fuzzing"
+# Validate domain with simple regex (basic)
+if ! [[ $domain =~ ^([a-zA-Z0-9][-a-zA-Z0-9]*\.)+[a-zA-Z]{2,}$ ]]; then
+    err "Invalid domain format: $domain"
+    exit 1
+fi
 
-echo -e "${CYAN} Starting recon for $TARGET...${NC}"
-sleep 1
+# Prepare output folder with timestamp
+ts=$(date '+%Y-%m-%d_%H-%M-%S')
+outdir="output/${domain}-${ts}"
+mkdir -p "$outdir/fuzzing"
 
-# 1️⃣ Subdomain Enumeration
-echo -e "${YELLOW}Finding subdomains (subfinder)...${NC}"
-subfinder -d "$TARGET" -silent > "$OUTPUT_DIR/subdomains.txt"
+LOGFILE="$outdir/recon.log"
+touch "$LOGFILE"
+log "Starting bug bounty recon for $domain"
 
-# 2️⃣ Live Host Probing
-echo -e "${YELLOW}Probing live hosts (httpx)...${NC}"
-httpx -silent -l "$OUTPUT_DIR/subdomains.txt" > "$OUTPUT_DIR/live.txt"
+# Source modular scripts
+script_dir="$(dirname "$(realpath "$0")")/src"
+if [[ ! -d $script_dir ]]; then
+    err "src/ folder missing! Please ensure modular scripts exist."
+    exit 1
+fi
 
-# 3️⃣ Port Scanning
-echo -e "${YELLOW}Scanning open ports (naabu)...${NC}"
-naabu -l "$OUTPUT_DIR/live.txt" -silent > "$OUTPUT_DIR/ports.txt"
+# Run subdomain enumeration
+bash "$script_dir/subdomain.sh" "$domain" "$outdir"
+if [[ $? -ne 0 ]]; then
+    err "Subdomain enumeration failed."
+    exit 2
+fi
 
-# 4️⃣ Directory Fuzzing (First 3 Live URLs)
-echo -e "${YELLOW}Fuzzing directories (ffuf)...${NC}"
-count=0
-while read url; do
-  if [[ $count -ge 3 ]]; then break; fi
-  filename=$(echo "$url" | sed 's|https\?://||;s|/||g')
-  ffuf -w "$WORDLIST" -u "$url/FUZZ" -of json -o "$OUTPUT_DIR/fuzzing/${filename}.json" -t 30
-  ((count++))
-done < "$OUTPUT_DIR/live.txt"
+# Run live host detection
+bash "$script_dir/livehost.sh" "$outdir"
+if [[ $? -ne 0 ]]; then
+    err "Live host detection failed."
+    exit 3
+fi
 
-echo -e "\n${GREEN}Recon completed successfully!${NC}"
-echo -e "${CYAN} Output saved to: $OUTPUT_DIR${NC}"
+# Run port scanning (background)
+bash "$script_dir/ports.sh" "$outdir" & 
+pid_ports=$!
+
+# Run directory fuzzing (background)
+bash "$script_dir/fuzz.sh" "$outdir" &
+pid_fuzz=$!
+
+wait $pid_ports
+if [[ $? -ne 0 ]]; then
+    err "Port scanning failed."
+    exit 4
+fi
+
+wait $pid_fuzz
+if [[ $? -ne 0 ]]; then
+    err "Directory fuzzing failed."
+    exit 5
+fi
+
+log "Recon completed for $domain."
+log "Results saved in $outdir"
+echo -e "${GRN}Done!${RST} Check outputs in $outdir"
 
